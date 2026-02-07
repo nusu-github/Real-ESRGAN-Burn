@@ -1,0 +1,14 @@
+[package]
+name = "real-esrgan-burn"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+burn = { version = "~0.20", default-features = false, features = ["std", "ndarray", "cuda", "fusion"] }
+burn-import = { version = "~0.20" }
+clap = { version = "4.5", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zip = "=7.0.0"
