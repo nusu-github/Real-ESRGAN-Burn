@@ -2,6 +2,11 @@
 name = "real-esrgan-burn"
 version = "0.1.0"
 edition = "2024"
+description = "Real-ESRGAN super-resolution inference implemented in Rust with the Burn deep learning framework"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["super-resolution", "esrgan", "burn", "deep-learning", "image-processing"]
+categories = ["computer-vision", "multimedia::images"]
 
 [dependencies]
 anyhow = "1.0"

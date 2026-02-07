@@ -109,7 +109,7 @@ fn run_all<B: Backend>(cli: &Cli) -> Result<()> {
 
                 match loaded {
                     Ok((model, loaded_key)) => {
-                        let generator = GeneratorModel::Rrdb(model);
+                        let generator = GeneratorModel::Rrdb(Box::new(model));
                         let output_path = cli
                             .output_dir
                             .join(variant.output_slug())
@@ -174,7 +174,7 @@ fn run_all<B: Backend>(cli: &Cli) -> Result<()> {
 
                 match loaded {
                     Ok((model, loaded_key)) => {
-                        let generator = GeneratorModel::Srvgg(model);
+                        let generator = GeneratorModel::Srvgg(Box::new(model));
                         let output_path = cli
                             .output_dir
                             .join(variant.output_slug())

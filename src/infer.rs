@@ -8,8 +8,8 @@ use crate::arch::rrdb::RrdbNet;
 use crate::arch::srvgg::SrvggNetCompact;
 
 pub enum GeneratorModel<B: Backend> {
-    Rrdb(RrdbNet<B>),
-    Srvgg(SrvggNetCompact<B>),
+    Rrdb(Box<RrdbNet<B>>),
+    Srvgg(Box<SrvggNetCompact<B>>),
 }
 
 impl<B: Backend> GeneratorModel<B> {
@@ -21,6 +21,7 @@ impl<B: Backend> GeneratorModel<B> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_generator_inference<B: Backend>(
     model: &GeneratorModel<B>,
     scale: usize,

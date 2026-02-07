@@ -1,2 +1,7 @@
 /target
 /models/*
+/outputs
+*.burnfix.pth
+.venv/
+.agents/
+/docs/
