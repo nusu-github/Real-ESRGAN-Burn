@@ -1,11 +1,19 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+//! The official Real-ESRGAN checkpoints and the networks they belong to.
+
+use std::fmt;
+use std::str::FromStr;
+
+use crate::arch::{
+    GeneratorConfig, RrdbNetConfig, SrvggNetCompactConfig, UnetDiscriminatorSnConfig,
+};
+
+#[derive(Debug, Clone)]
 pub enum Architecture {
-    Rrdb { scale: usize, num_block: usize },
-    Srvgg { scale: usize, num_conv: usize },
-    Discriminator,
+    Generator(GeneratorConfig),
+    Discriminator(UnetDiscriminatorSnConfig),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelVariant {
     RealEsrganX4Plus,
     RealEsrganX2Plus,
@@ -20,21 +28,20 @@ pub enum ModelVariant {
 }
 
 impl ModelVariant {
-    pub const fn all() -> [Self; 10] {
-        [
-            Self::RealEsrganX4Plus,
-            Self::RealEsrganX2Plus,
-            Self::RealEsrnetX4Plus,
-            Self::EsrganSrX4Df2kostOfficial,
-            Self::RealEsrganX4PlusAnime6B,
-            Self::RealEsrAnimeVideoV3,
-            Self::RealEsrGeneralX4V3,
-            Self::RealEsrganX4PlusNetD,
-            Self::RealEsrganX2PlusNetD,
-            Self::RealEsrganX4PlusAnime6BNetD,
-        ]
-    }
+    pub const ALL: [Self; 10] = [
+        Self::RealEsrganX4Plus,
+        Self::RealEsrganX2Plus,
+        Self::RealEsrnetX4Plus,
+        Self::EsrganSrX4Df2kostOfficial,
+        Self::RealEsrganX4PlusAnime6B,
+        Self::RealEsrAnimeVideoV3,
+        Self::RealEsrGeneralX4V3,
+        Self::RealEsrganX4PlusNetD,
+        Self::RealEsrganX2PlusNetD,
+        Self::RealEsrganX4PlusAnime6BNetD,
+    ];
 
+    /// The official model name, e.g. `RealESRGAN_x4plus`.
     pub const fn name(self) -> &'static str {
         match self {
             Self::RealEsrganX4Plus => "RealESRGAN_x4plus",
@@ -50,10 +57,7 @@ impl ModelVariant {
         }
     }
 
-    pub const fn output_slug(self) -> &'static str {
-        self.name()
-    }
-
+    /// File name of the official release asset.
     pub const fn file_name(self) -> &'static str {
         match self {
             Self::RealEsrganX4Plus => "RealESRGAN_x4plus.pth",
@@ -69,42 +73,35 @@ impl ModelVariant {
         }
     }
 
-    pub const fn architecture(self) -> Architecture {
+    pub fn architecture(self) -> Architecture {
+        let rrdb = |scale, num_block| {
+            Architecture::Generator(GeneratorConfig::Rrdb(
+                RrdbNetConfig::new(scale).with_num_block(num_block),
+            ))
+        };
+        let srvgg = |num_conv| {
+            Architecture::Generator(GeneratorConfig::Srvgg(
+                SrvggNetCompactConfig::new(4).with_num_conv(num_conv),
+            ))
+        };
+
         match self {
-            Self::RealEsrganX4Plus => Architecture::Rrdb {
-                scale: 4,
-                num_block: 23,
-            },
-            Self::RealEsrganX2Plus => Architecture::Rrdb {
-                scale: 2,
-                num_block: 23,
-            },
-            Self::RealEsrnetX4Plus => Architecture::Rrdb {
-                scale: 4,
-                num_block: 23,
-            },
-            Self::EsrganSrX4Df2kostOfficial => Architecture::Rrdb {
-                scale: 4,
-                num_block: 23,
-            },
-            Self::RealEsrganX4PlusAnime6B => Architecture::Rrdb {
-                scale: 4,
-                num_block: 6,
-            },
-            Self::RealEsrAnimeVideoV3 => Architecture::Srvgg {
-                scale: 4,
-                num_conv: 16,
-            },
-            Self::RealEsrGeneralX4V3 => Architecture::Srvgg {
-                scale: 4,
-                num_conv: 32,
-            },
+            Self::RealEsrganX4Plus | Self::RealEsrnetX4Plus | Self::EsrganSrX4Df2kostOfficial => {
+                rrdb(4, 23)
+            }
+            Self::RealEsrganX2Plus => rrdb(2, 23),
+            Self::RealEsrganX4PlusAnime6B => rrdb(4, 6),
+            Self::RealEsrAnimeVideoV3 => srvgg(16),
+            Self::RealEsrGeneralX4V3 => srvgg(32),
             Self::RealEsrganX4PlusNetD
             | Self::RealEsrganX2PlusNetD
-            | Self::RealEsrganX4PlusAnime6BNetD => Architecture::Discriminator,
+            | Self::RealEsrganX4PlusAnime6BNetD => {
+                Architecture::Discriminator(UnetDiscriminatorSnConfig::new())
+            }
         }
     }
 
+    /// Keys under which the checkpoint may store its state dict, in order of preference.
     pub const fn top_level_keys(self) -> &'static [&'static str] {
         match self {
             Self::RealEsrganX4Plus
@@ -119,21 +116,65 @@ impl ModelVariant {
             | Self::RealEsrganX4PlusAnime6BNetD => &["params"],
         }
     }
+}
 
-    pub const fn is_generator(self) -> bool {
-        !matches!(self.architecture(), Architecture::Discriminator)
+impl fmt::Display for ModelVariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownModel(pub String);
+
+impl fmt::Display for UnknownModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<_> = ModelVariant::ALL.iter().map(|v| v.name()).collect();
+        write!(
+            f,
+            "unknown model `{}`; expected one of: {}",
+            self.0,
+            names.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownModel {}
+
+impl FromStr for ModelVariant {
+    type Err = UnknownModel;
+
+    /// Parses the official model name (see [`ModelVariant::name`]).
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|variant| variant.name() == name)
+            .ok_or_else(|| UnknownModel(name.to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ModelVariant;
+    use super::*;
 
     #[test]
-    fn all_variants_are_listed() {
-        let all = ModelVariant::all();
-        assert_eq!(all.len(), 10);
-        assert_eq!(all[0].name(), "RealESRGAN_x4plus");
-        assert_eq!(all[9].name(), "RealESRGAN_x4plus_anime_6B_netD");
+    fn names_round_trip() {
+        for variant in ModelVariant::ALL {
+            assert_eq!(variant.name().parse::<ModelVariant>(), Ok(variant));
+            assert!(variant.file_name().starts_with(variant.name()));
+        }
+        assert!("RealESRGAN_x8plus".parse::<ModelVariant>().is_err());
+    }
+
+    #[test]
+    fn generator_scales() {
+        let scales: Vec<_> = ModelVariant::ALL
+            .into_iter()
+            .filter_map(|variant| match variant.architecture() {
+                Architecture::Generator(config) => Some(config.scale()),
+                Architecture::Discriminator(_) => None,
+            })
+            .collect();
+        assert_eq!(scales, [4, 2, 4, 4, 4, 4, 4]);
     }
 }

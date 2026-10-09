@@ -1,8 +1,9 @@
 # Real-ESRGAN-Burn
 
-[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) super-resolution inference implemented in Rust with the [Burn](https://burn.dev/) deep learning framework.
+[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) super-resolution inference implemented in Rust with the [Burn](https://burn.dev/) deep learning framework (0.22).
 
-Loads official PyTorch weight files directly and runs tiled inference to upscale images.
+Loads the official PyTorch weight files directly and runs tiled inference to upscale images.
+Outputs match the PyTorch reference implementation (checked in `tests/pytorch_parity.rs`).
 
 ## Supported Models
 
@@ -15,67 +16,91 @@ Loads official PyTorch weight files directly and runs tiled inference to upscale
 | RealESRGAN_x4plus_anime_6B      | RRDB (6 blocks)            | 4x    |
 | realesr-animevideov3            | SRVGGNetCompact (16 convs) | 4x    |
 | realesr-general-x4v3            | SRVGGNetCompact (32 convs) | 4x    |
-| RealESRGAN_x4plus_netD          | UNet Discriminator         | -     |
-| RealESRGAN_x2plus_netD          | UNet Discriminator         | -     |
-| RealESRGAN_x4plus_anime_6B_netD | UNet Discriminator         | -     |
+| RealESRGAN_x4plus_netD          | UNet Discriminator (SN)    | -     |
+| RealESRGAN_x2plus_netD          | UNet Discriminator (SN)    | -     |
+| RealESRGAN_x4plus_anime_6B_netD | UNet Discriminator (SN)    | -     |
+
+Discriminators are only loaded (to check the weights), not run on the input.
 
 ## Prerequisites
 
-- **Rust** (edition 2024)
-- **CUDA toolkit** (for GPU backend; NdArray backend works on CPU)
-- **Python + PyTorch** (only needed for `ESRGAN_SRx4_DF2KOST_official` checkpoint conversion)
+- **Rust** 1.95 or newer
 - **Model weight files** (`.pth`) from the [official Real-ESRGAN releases](https://github.com/xinntao/Real-ESRGAN/releases)
+- For the `cuda` backend: an NVIDIA driver at run time, and network access on the first build
+  (CubeCL downloads an LLVM bundle, ~45 MB, into `~/.cache/tracel` and `~/.local/share/tracel`)
 
-## Setup
+Both checkpoint formats (zip, PyTorch >= 1.6, and the legacy pickle format of
+`ESRGAN_SRx4_DF2KOST_official`) are read natively; Python is not needed.
 
-1. Clone the repository:
+## Backends
+
+Backends are Cargo features of this crate. `flex` and `cuda` are enabled by default.
+
+| Feature | Device                          | Notes                                   |
+| ------- | ------------------------------- | --------------------------------------- |
+| `flex`  | CPU (pure Rust)                 | No build or runtime requirements        |
+| `cuda`  | NVIDIA GPUs                     | Downloads the LLVM bundle on first build |
+| `wgpu`  | Any GPU (Vulkan, Metal, DX12)   | Needs a Vulkan/Metal/DX12 driver        |
 
 ```sh
-git clone https://github.com/<your-username>/Real-ESRGAN-Burn.git
-cd Real-ESRGAN-Burn
+# CPU only (fastest to build)
+cargo build --release --no-default-features --features flex
+
+# CPU + any GPU through wgpu
+cargo build --release --no-default-features --features flex,wgpu
 ```
-
-1. Download model weights into the `models/` directory:
-
-```sh
-mkdir -p models
-# Download the weights you want from:
-# https://github.com/xinntao/Real-ESRGAN/releases
-```
-
-1. Place a test image at `assets/test.jpg` (or specify `--input`).
 
 ## Usage
 
 ```sh
-# Run all models with CUDA backend (default)
-cargo run --release -- --run-all
+mkdir -p models
+# Download the weights you want from https://github.com/xinntao/Real-ESRGAN/releases
 
-# Use NdArray (CPU) backend
-cargo run --release -- --run-all --backend ndarray
+# Run every model (auto-selects the device); missing weight files are reported as failures
+cargo run --release -- --input path/to/image.jpg
 
-# Custom options
-cargo run --release -- --run-all \
-    --models-dir models \
-    --input path/to/image.jpg \
-    --output-dir outputs \
-    --tile-size 128 \
-    --tile-pad 10 \
-    --input-max-edge 512
+# Only some models, on the CPU
+cargo run --release -- --input image.jpg --device flex \
+    --model RealESRGAN_x4plus --model realesr-general-x4v3
 ```
+
+Each model writes `<output-dir>/<model>/<input stem>.png`, and a summary is written to
+`<output-dir>/run_report.json`.
 
 ### CLI Options
 
-| Option             | Default           | Description                                   |
-| ------------------ | ----------------- | --------------------------------------------- |
-| `--run-all`        | required          | Run inference with all available models       |
-| `--backend`        | `cuda`            | Backend: `cuda` or `ndarray`                  |
-| `--models-dir`     | `models`          | Directory containing `.pth` weight files      |
-| `--input`          | `assets/test.jpg` | Input image path                              |
-| `--output-dir`     | `outputs`         | Output directory                              |
-| `--tile-size`      | `128`             | Tile size for tiled inference (0 = no tiling) |
-| `--tile-pad`       | `10`              | Padding around each tile                      |
-| `--input-max-edge` | none              | Resize input so longest edge <= this value    |
+| Option             | Default           | Description                                                     |
+| ------------------ | ----------------- | --------------------------------------------------------------- |
+| `--input`          | `assets/test.jpg` | Input image path                                                |
+| `--model`          | all               | Model to run, by official name (repeatable)                     |
+| `--device`         | `auto`            | `auto`, `cuda`, `wgpu` or `flex` (depending on enabled features) |
+| `--models-dir`     | `models`          | Directory containing `.pth` weight files                        |
+| `--output-dir`     | `outputs`         | Output directory                                                |
+| `--tile-size`      | `128`             | Tile size for tiled inference (0 = no tiling)                   |
+| `--tile-pad`       | `10`              | Padding around each tile                                        |
+| `--input-max-edge` | none              | Resize input so longest edge <= this value                      |
+
+`--device auto` picks CUDA if a CUDA device is present, then a hardware wgpu adapter, then the CPU.
+
+## Library
+
+The crate is also a library: build a network from `ModelVariant::architecture()`, load the
+official weights with `loader::load_pytorch_weights`, and run `infer::upscale` on any `Device`.
+See [`examples/upscale.rs`](examples/upscale.rs):
+
+```sh
+cargo run --release --example upscale -- RealESRGAN_x4plus models/RealESRGAN_x4plus.pth in.png out.png
+```
+
+Library users who want to choose backends themselves can depend on the crate with
+`default-features = false`.
+
+## Development
+
+```sh
+cargo test                                 # unit tests and PyTorch parity tests (on Flex)
+python tests/fixtures/gen_fixtures.py      # regenerate the parity fixtures (needs torch)
+```
 
 ## License
 

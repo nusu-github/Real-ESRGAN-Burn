@@ -1,92 +1,124 @@
-use burn::module::Ignored;
-use burn::nn::conv::{Conv2d, Conv2dConfig};
-use burn::nn::interpolate::{Interpolate2dConfig, InterpolateMode};
-use burn::nn::{LeakyRelu, LeakyReluConfig, PaddingConfig2d};
+//! RRDBNet, the ESRGAN generator (`basicsr.archs.rrdbnet_arch.RRDBNet`).
+//!
+//! Field names mirror the PyTorch module, so official checkpoints load without key remapping.
+
+use burn::nn::conv::Conv2d;
+use burn::nn::{PixelUnshuffle, PixelUnshuffleConfig};
 use burn::prelude::*;
+use burn::tensor::activation::leaky_relu;
 
-fn conv3x3<B: Backend>(channels_in: usize, channels_out: usize, device: &B::Device) -> Conv2d<B> {
-    Conv2dConfig::new([channels_in, channels_out], [3, 3])
-        .with_padding(PaddingConfig2d::Explicit(1, 1))
-        .init(device)
+use super::ops::{conv3x3, upsample_nearest};
+
+const NEGATIVE_SLOPE: f64 = 0.2;
+/// Residual scaling applied inside every dense block and RRDB.
+const RESIDUAL_SCALE: f64 = 0.2;
+
+#[derive(Config, Debug)]
+pub struct RrdbNetConfig {
+    /// Upscaling factor: 1, 2 or 4.
+    pub scale: usize,
+    #[config(default = 3)]
+    pub num_in_ch: usize,
+    #[config(default = 3)]
+    pub num_out_ch: usize,
+    #[config(default = 64)]
+    pub num_feat: usize,
+    #[config(default = 23)]
+    pub num_block: usize,
+    #[config(default = 32)]
+    pub num_grow_ch: usize,
 }
 
-fn nearest_upsample_2x<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
-    Interpolate2dConfig::new()
-        .with_mode(InterpolateMode::Nearest)
-        .with_scale_factor(Some([2.0, 2.0]))
-        .init()
-        .forward(x)
-}
+impl RrdbNetConfig {
+    /// # Panics
+    ///
+    /// If `scale` is not 1, 2 or 4.
+    pub fn init(&self, device: &Device) -> RrdbNet {
+        // The trunk always upsamples 4x; smaller scales fold pixels into channels first.
+        let unshuffle_factor = match self.scale {
+            4 => None,
+            2 => Some(2),
+            1 => Some(4),
+            scale => panic!("RRDBNet supports scale 1, 2 or 4, got {scale}"),
+        };
+        let in_ch = self.num_in_ch * unshuffle_factor.map_or(1, |f| f * f);
+        let feat = self.num_feat;
 
-pub fn pixel_unshuffle<B: Backend>(x: Tensor<B, 4>, scale: usize) -> Tensor<B, 4> {
-    let [b, c, hh, hw] = x.dims();
-    assert!(hh % scale == 0, "height must be divisible by scale");
-    assert!(hw % scale == 0, "width must be divisible by scale");
-
-    let h = hh / scale;
-    let w = hw / scale;
-    let out_c = c * scale * scale;
-
-    x.reshape([b, c, h, scale, w, scale])
-        .permute([0, 1, 3, 5, 2, 4])
-        .reshape([b, out_c, h, w])
-}
-
-#[derive(Module, Debug)]
-pub struct ResidualDenseBlock<B: Backend> {
-    conv1: Conv2d<B>,
-    conv2: Conv2d<B>,
-    conv3: Conv2d<B>,
-    conv4: Conv2d<B>,
-    conv5: Conv2d<B>,
-    lrelu: Ignored<LeakyRelu>,
-}
-
-impl<B: Backend> ResidualDenseBlock<B> {
-    pub fn new(num_feat: usize, num_grow_ch: usize, device: &B::Device) -> Self {
-        let lrelu = LeakyReluConfig::new().with_negative_slope(0.2).init();
-
-        Self {
-            conv1: conv3x3(num_feat, num_grow_ch, device),
-            conv2: conv3x3(num_feat + num_grow_ch, num_grow_ch, device),
-            conv3: conv3x3(num_feat + 2 * num_grow_ch, num_grow_ch, device),
-            conv4: conv3x3(num_feat + 3 * num_grow_ch, num_grow_ch, device),
-            conv5: conv3x3(num_feat + 4 * num_grow_ch, num_feat, device),
-            lrelu: Ignored(lrelu),
+        RrdbNet {
+            unshuffle: unshuffle_factor.map(|f| PixelUnshuffleConfig::new(f).init()),
+            conv_first: conv3x3(in_ch, feat, device),
+            body: (0..self.num_block)
+                .map(|_| Rrdb::new(feat, self.num_grow_ch, device))
+                .collect(),
+            conv_body: conv3x3(feat, feat, device),
+            conv_up1: conv3x3(feat, feat, device),
+            conv_up2: conv3x3(feat, feat, device),
+            conv_hr: conv3x3(feat, feat, device),
+            conv_last: conv3x3(feat, self.num_out_ch, device),
+            scale: self.scale,
         }
     }
-
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let x1 = self.lrelu.0.forward(self.conv1.forward(x.clone()));
-        let x2 = self.lrelu.0.forward(
-            self.conv2
-                .forward(Tensor::cat(vec![x.clone(), x1.clone()], 1)),
-        );
-        let x3 = self.lrelu.0.forward(
-            self.conv3
-                .forward(Tensor::cat(vec![x.clone(), x1.clone(), x2.clone()], 1)),
-        );
-        let x4 = self.lrelu.0.forward(self.conv4.forward(Tensor::cat(
-            vec![x.clone(), x1.clone(), x2.clone(), x3.clone()],
-            1,
-        )));
-        let x5 = self
-            .conv5
-            .forward(Tensor::cat(vec![x.clone(), x1, x2, x3, x4], 1));
-
-        x + x5 * 0.2
-    }
 }
 
 #[derive(Module, Debug)]
-pub struct Rrdb<B: Backend> {
-    rdb1: ResidualDenseBlock<B>,
-    rdb2: ResidualDenseBlock<B>,
-    rdb3: ResidualDenseBlock<B>,
+pub struct RrdbNet {
+    unshuffle: Option<PixelUnshuffle>,
+    conv_first: Conv2d,
+    body: Vec<Rrdb>,
+    conv_body: Conv2d,
+    conv_up1: Conv2d,
+    conv_up2: Conv2d,
+    conv_hr: Conv2d,
+    conv_last: Conv2d,
+    scale: usize,
 }
 
-impl<B: Backend> Rrdb<B> {
-    pub fn new(num_feat: usize, num_grow_ch: usize, device: &B::Device) -> Self {
+impl RrdbNet {
+    pub fn scale(&self) -> usize {
+        self.scale
+    }
+
+    /// Input height and width must be multiples of this value.
+    pub fn input_multiple(&self) -> usize {
+        self.unshuffle.as_ref().map_or(1, |u| u.downscale_factor)
+    }
+
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        let x = match &self.unshuffle {
+            Some(unshuffle) => unshuffle.forward(x),
+            None => x,
+        };
+
+        let feat = self.conv_first.forward(x);
+        let body = self
+            .body
+            .iter()
+            .fold(feat.clone(), |h, block| block.forward(h));
+        let feat = feat + self.conv_body.forward(body);
+
+        let feat = leaky_relu(
+            self.conv_up1.forward(upsample_nearest(feat, 2)),
+            NEGATIVE_SLOPE,
+        );
+        let feat = leaky_relu(
+            self.conv_up2.forward(upsample_nearest(feat, 2)),
+            NEGATIVE_SLOPE,
+        );
+        self.conv_last
+            .forward(leaky_relu(self.conv_hr.forward(feat), NEGATIVE_SLOPE))
+    }
+}
+
+/// Residual in Residual Dense Block.
+#[derive(Module, Debug)]
+pub struct Rrdb {
+    rdb1: ResidualDenseBlock,
+    rdb2: ResidualDenseBlock,
+    rdb3: ResidualDenseBlock,
+}
+
+impl Rrdb {
+    fn new(num_feat: usize, num_grow_ch: usize, device: &Device) -> Self {
         Self {
             rdb1: ResidualDenseBlock::new(num_feat, num_grow_ch, device),
             rdb2: ResidualDenseBlock::new(num_feat, num_grow_ch, device),
@@ -94,109 +126,92 @@ impl<B: Backend> Rrdb<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let out = self
             .rdb3
             .forward(self.rdb2.forward(self.rdb1.forward(x.clone())));
-        x + out * 0.2
+        x + out * RESIDUAL_SCALE
     }
 }
 
 #[derive(Module, Debug)]
-pub struct RrdbNet<B: Backend> {
-    conv_first: Conv2d<B>,
-    body: Vec<Rrdb<B>>,
-    conv_body: Conv2d<B>,
-    conv_up1: Conv2d<B>,
-    conv_up2: Conv2d<B>,
-    conv_hr: Conv2d<B>,
-    conv_last: Conv2d<B>,
-    scale: Ignored<usize>,
-    lrelu: Ignored<LeakyRelu>,
+pub struct ResidualDenseBlock {
+    conv1: Conv2d,
+    conv2: Conv2d,
+    conv3: Conv2d,
+    conv4: Conv2d,
+    conv5: Conv2d,
 }
 
-impl<B: Backend> RrdbNet<B> {
-    pub fn new(
-        num_in_ch: usize,
-        num_out_ch: usize,
-        scale: usize,
-        num_block: usize,
-        num_feat: usize,
-        num_grow_ch: usize,
-        device: &B::Device,
-    ) -> Self {
-        let adjusted_in_ch = match scale {
-            2 => num_in_ch * 4,
-            1 => num_in_ch * 16,
-            _ => num_in_ch,
-        };
-        let lrelu = LeakyReluConfig::new().with_negative_slope(0.2).init();
-
+impl ResidualDenseBlock {
+    fn new(num_feat: usize, num_grow_ch: usize, device: &Device) -> Self {
+        let conv_in = |i: usize| num_feat + i * num_grow_ch;
         Self {
-            conv_first: conv3x3(adjusted_in_ch, num_feat, device),
-            body: (0..num_block)
-                .map(|_| Rrdb::new(num_feat, num_grow_ch, device))
-                .collect(),
-            conv_body: conv3x3(num_feat, num_feat, device),
-            conv_up1: conv3x3(num_feat, num_feat, device),
-            conv_up2: conv3x3(num_feat, num_feat, device),
-            conv_hr: conv3x3(num_feat, num_feat, device),
-            conv_last: conv3x3(num_feat, num_out_ch, device),
-            scale: Ignored(scale),
-            lrelu: Ignored(lrelu),
+            conv1: conv3x3(conv_in(0), num_grow_ch, device),
+            conv2: conv3x3(conv_in(1), num_grow_ch, device),
+            conv3: conv3x3(conv_in(2), num_grow_ch, device),
+            conv4: conv3x3(conv_in(3), num_grow_ch, device),
+            conv5: conv3x3(conv_in(4), num_feat, device),
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let mut feat = match self.scale.0 {
-            2 => pixel_unshuffle(x, 2),
-            1 => pixel_unshuffle(x, 4),
-            _ => x,
-        };
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        let lrelu = |t| leaky_relu(t, NEGATIVE_SLOPE);
 
-        feat = self.conv_first.forward(feat);
+        let x1 = lrelu(self.conv1.forward(x.clone()));
+        let x2 = lrelu(
+            self.conv2
+                .forward(Tensor::cat(vec![x.clone(), x1.clone()], 1)),
+        );
+        let x3 = lrelu(
+            self.conv3
+                .forward(Tensor::cat(vec![x.clone(), x1.clone(), x2.clone()], 1)),
+        );
+        let x4 = lrelu(self.conv4.forward(Tensor::cat(
+            vec![x.clone(), x1.clone(), x2.clone(), x3.clone()],
+            1,
+        )));
+        let x5 = self
+            .conv5
+            .forward(Tensor::cat(vec![x.clone(), x1, x2, x3, x4], 1));
 
-        let mut body_feat = feat.clone();
-        for block in &self.body {
-            body_feat = block.forward(body_feat);
-        }
-        body_feat = self.conv_body.forward(body_feat);
-
-        feat = feat + body_feat;
-        feat = self
-            .lrelu
-            .0
-            .forward(self.conv_up1.forward(nearest_upsample_2x(feat)));
-        feat = self
-            .lrelu
-            .0
-            .forward(self.conv_up2.forward(nearest_upsample_2x(feat)));
-
-        self.conv_last
-            .forward(self.lrelu.0.forward(self.conv_hr.forward(feat)))
+        x + x5 * RESIDUAL_SCALE
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "flex"))]
 mod tests {
     use super::*;
 
-    type B = burn::backend::NdArray;
-
-    #[test]
-    fn pixel_unshuffle_scale_2_shape() {
-        let device = Default::default();
-        let x = Tensor::<B, 4>::zeros([1, 3, 8, 8], &device);
-        let y = pixel_unshuffle(x, 2);
-        assert_eq!(y.dims(), [1, 12, 4, 4]);
+    fn tiny(scale: usize) -> RrdbNetConfig {
+        RrdbNetConfig::new(scale)
+            .with_num_feat(8)
+            .with_num_block(1)
+            .with_num_grow_ch(4)
     }
 
     #[test]
-    fn rrdb_x2_output_shape() {
-        let device = Default::default();
-        let model = RrdbNet::<B>::new(3, 3, 2, 2, 64, 32, &device);
-        let x = Tensor::<B, 4>::zeros([1, 3, 8, 8], &device);
-        let y = model.forward(x);
-        assert_eq!(y.dims(), [1, 3, 16, 16]);
+    fn output_shape_matches_scale() {
+        let device = Device::flex();
+        for scale in [1, 2, 4] {
+            let model = tiny(scale).init(&device);
+            let y = model.forward(Tensor::zeros([1, 3, 8, 12], &device));
+            assert_eq!(y.dims(), [1, 3, 8 * scale, 12 * scale], "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn input_multiple_follows_unshuffle() {
+        let device = Device::flex();
+        let multiples: Vec<_> = [1, 2, 4]
+            .map(|scale| tiny(scale).init(&device).input_multiple())
+            .into();
+        assert_eq!(multiples, [4, 2, 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "RRDBNet supports scale 1, 2 or 4")]
+    fn unsupported_scale_panics() {
+        tiny(3).init(&Device::flex());
     }
 }
