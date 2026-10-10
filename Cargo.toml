@@ -1,19 +1,39 @@
 [package]
 name = "real-esrgan-burn"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.95"
 description = "Real-ESRGAN super-resolution inference implemented in Rust with the Burn deep learning framework"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["super-resolution", "esrgan", "burn", "deep-learning", "image-processing"]
 categories = ["computer-vision", "multimedia::images"]
 
+[features]
+default = ["flex", "cuda"]
+# Pure-Rust CPU backend. No build or runtime requirements.
+flex = ["burn/flex", "burn/simd", "burn/rayon"]
+# NVIDIA GPUs. The first build downloads the LLVM bundle used by CubeCL.
+cuda = ["burn/cuda", "burn/fusion", "burn/autotune"]
+# Any GPU through wgpu (Vulkan, Metal, DirectX 12).
+wgpu = ["burn/wgpu", "burn/fusion", "burn/autotune"]
+
 [dependencies]
 anyhow = "1.0"
-burn = { version = "~0.20", default-features = false, features = ["std", "ndarray", "cuda", "fusion"] }
-burn-import = { version = "~0.20" }
+burn = { version = "0.22.0", default-features = false, features = ["std", "pytorch"] }
 clap = { version = "4.5", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-zip = "=7.0.0"
+
+[[example]]
+name = "upscale"
+required-features = ["flex"]
+
+[profile.dev]
+debug = "line-tables-only"
+
+# Burn is unusably slow (and slow to link) without optimizing dependencies.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

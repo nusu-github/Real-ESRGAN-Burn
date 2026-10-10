@@ -1,139 +1,157 @@
+//! Image pre/post-processing and tiled inference, following `realesrgan.utils.RealESRGANer`.
+
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, ensure};
 use burn::prelude::*;
+use burn::tensor::ops::PadMode;
 use image::{Rgb, RgbImage};
 
-use crate::arch::rrdb::RrdbNet;
-use crate::arch::srvgg::SrvggNetCompact;
+use crate::arch::Generator;
 
-pub enum GeneratorModel<B: Backend> {
-    Rrdb(Box<RrdbNet<B>>),
-    Srvgg(Box<SrvggNetCompact<B>>),
+/// Splits the input into `tile_size` squares, each run with `tile_pad` pixels of context on
+/// every side, to bound memory use. `tile_size == 0` runs the whole image at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tiling {
+    pub tile_size: usize,
+    pub tile_pad: usize,
 }
 
-impl<B: Backend> GeneratorModel<B> {
-    pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
-        match self {
-            Self::Rrdb(model) => model.forward(input),
-            Self::Srvgg(model) => model.forward(input),
-        }
+/// One tile of the input: `core` is the region it produces, `padded` the region it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tile {
+    pub core: Region,
+    pub padded: Region,
+}
+
+/// A rectangle `[top, bottom) x [left, right)` in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub top: usize,
+    pub left: usize,
+    pub bottom: usize,
+    pub right: usize,
+}
+
+impl Region {
+    pub fn height(&self) -> usize {
+        self.bottom - self.top
+    }
+
+    pub fn width(&self) -> usize {
+        self.right - self.left
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run_generator_inference<B: Backend>(
-    model: &GeneratorModel<B>,
-    scale: usize,
-    input_path: &Path,
-    output_path: &Path,
-    max_input_edge: Option<usize>,
-    tile_size: usize,
-    tile_pad: usize,
-    device: &B::Device,
-) -> Result<()> {
-    let input_image = load_rgb_image(input_path, max_input_edge)?;
-    let input_tensor = rgb_image_to_tensor::<B>(&input_image, device);
-    let output_tensor =
-        run_generator_forward_tiled(model, input_tensor, scale, tile_size, tile_pad, device);
-    let output_image = tensor_to_rgb_image(output_tensor)?;
-    save_rgb_image(&output_image, output_path)
+impl Tiling {
+    pub const NONE: Self = Self {
+        tile_size: 0,
+        tile_pad: 0,
+    };
+
+    /// The tiles covering a `height x width` image, row by row.
+    pub fn tiles(&self, height: usize, width: usize) -> Vec<Tile> {
+        let step = if self.tile_size == 0 {
+            height.max(width).max(1)
+        } else {
+            self.tile_size
+        };
+        let pad = self.tile_pad;
+
+        let mut tiles = Vec::new();
+        for top in (0..height).step_by(step) {
+            for left in (0..width).step_by(step) {
+                let core = Region {
+                    top,
+                    left,
+                    bottom: (top + step).min(height),
+                    right: (left + step).min(width),
+                };
+                let padded = Region {
+                    top: top.saturating_sub(pad),
+                    left: left.saturating_sub(pad),
+                    bottom: (core.bottom + pad).min(height),
+                    right: (core.right + pad).min(width),
+                };
+                tiles.push(Tile { core, padded });
+            }
+        }
+        tiles
+    }
 }
 
-fn run_generator_forward_tiled<B: Backend>(
-    model: &GeneratorModel<B>,
-    input: Tensor<B, 4>,
-    scale: usize,
-    tile_size: usize,
-    tile_pad: usize,
-    device: &B::Device,
-) -> Tensor<B, 4> {
-    let [batch, channels, height, width] = input.dims();
-    if tile_size == 0 || (height <= tile_size && width <= tile_size) {
-        return model.forward(input);
-    }
+/// Upscales `image` by `model.scale()`.
+pub fn upscale(model: &Generator, image: &RgbImage, tiling: Tiling, device: &Device) -> RgbImage {
+    let scale = model.scale();
+    let input = rgb_image_to_tensor(image, device);
+    let [_, _, height, width] = input.dims();
+    let mut output = RgbImage::new((width * scale) as u32, (height * scale) as u32);
 
-    let mut output =
-        Tensor::<B, 4>::zeros([batch, channels, height * scale, width * scale], device);
-
-    let mut top = 0usize;
-    while top < height {
-        let bottom = (top + tile_size).min(height);
-        let mut left = 0usize;
-
-        while left < width {
-            let right = (left + tile_size).min(width);
-
-            let pad_top = top.saturating_sub(tile_pad);
-            let pad_left = left.saturating_sub(tile_pad);
-            let pad_bottom = (bottom + tile_pad).min(height);
-            let pad_right = (right + tile_pad).min(width);
-
-            let tile = input.clone().slice([
-                0..batch,
-                0..channels,
-                pad_top..pad_bottom,
-                pad_left..pad_right,
-            ]);
-            let tile_output = model.forward(tile);
-
-            let crop_top = (top - pad_top) * scale;
-            let crop_left = (left - pad_left) * scale;
-            let crop_bottom = crop_top + (bottom - top) * scale;
-            let crop_right = crop_left + (right - left) * scale;
-
-            let tile_output = tile_output.slice([
-                0..batch,
-                0..channels,
-                crop_top..crop_bottom,
-                crop_left..crop_right,
-            ]);
-
-            let out_top = top * scale;
-            let out_left = left * scale;
-            let out_bottom = bottom * scale;
-            let out_right = right * scale;
-
-            output = output.slice_assign(
-                [
-                    0..batch,
-                    0..channels,
-                    out_top..out_bottom,
-                    out_left..out_right,
-                ],
-                tile_output,
-            );
-
-            left += tile_size;
-        }
-
-        top += tile_size;
+    for Tile { core, padded } in tiling.tiles(height, width) {
+        let patch = input.clone().slice(s![
+            ..,
+            ..,
+            padded.top..padded.bottom,
+            padded.left..padded.right
+        ]);
+        let top = (core.top - padded.top) * scale;
+        let left = (core.left - padded.left) * scale;
+        let result = forward_padded(model, patch).slice(s![
+            ..,
+            ..,
+            top..top + core.height() * scale,
+            left..left + core.width() * scale
+        ]);
+        write_tensor_into(&mut output, result, core.left * scale, core.top * scale);
     }
 
     output
 }
 
-pub fn load_rgb_image(path: &Path, max_input_edge: Option<usize>) -> Result<RgbImage> {
-    let image = image::open(path).map_err(|e| anyhow!("failed to open {:?}: {e}", path))?;
-    let image = image.to_rgb8();
+/// Runs `model` on an input of any size: pads the bottom and right edges up to the input
+/// multiple the network needs (reflecting, like `RealESRGANer`), then crops the result.
+fn forward_padded(model: &Generator, x: Tensor<4>) -> Tensor<4> {
+    let [_, _, height, width] = x.dims();
+    let multiple = model.input_multiple();
+    let pad_h = height.next_multiple_of(multiple) - height;
+    let pad_w = width.next_multiple_of(multiple) - width;
+    if pad_h == 0 && pad_w == 0 {
+        return model.forward(x);
+    }
 
-    if let Some(max_edge) = max_input_edge {
-        let (w, h) = image.dimensions();
-        let current_max = w.max(h) as usize;
-        if current_max > max_edge {
-            let scale = max_edge as f32 / current_max as f32;
-            let new_w = (w as f32 * scale).round().max(1.0) as u32;
-            let new_h = (h as f32 * scale).round().max(1.0) as u32;
-            return Ok(image::imageops::resize(
+    // Reflection needs more pixels than it pads; tiny inputs fall back to edge replication.
+    let mode = if pad_h < height && pad_w < width {
+        PadMode::Reflect
+    } else {
+        PadMode::Edge
+    };
+    let scale = model.scale();
+    model
+        .forward(x.pad([(0, pad_h), (0, pad_w)], mode))
+        .slice(s![.., .., 0..height * scale, 0..width * scale])
+}
+
+pub fn load_rgb_image(path: &Path, max_edge: Option<usize>) -> Result<RgbImage> {
+    let image = image::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .to_rgb8();
+
+    let (w, h) = image.dimensions();
+    let longest = w.max(h) as usize;
+    match max_edge {
+        Some(max_edge) if longest > max_edge => {
+            let ratio = max_edge as f64 / longest as f64;
+            let new_w = ((f64::from(w) * ratio).round() as u32).max(1);
+            let new_h = ((f64::from(h) * ratio).round() as u32).max(1);
+            Ok(image::imageops::resize(
                 &image,
                 new_w,
                 new_h,
                 image::imageops::FilterType::CatmullRom,
-            ));
+            ))
         }
+        _ => Ok(image),
     }
-
-    Ok(image)
 }
 
 pub fn save_rgb_image(image: &RgbImage, path: &Path) -> Result<()> {
@@ -142,83 +160,174 @@ pub fn save_rgb_image(image: &RgbImage, path: &Path) -> Result<()> {
     }
     image
         .save(path)
-        .map_err(|e| anyhow!("failed to save {:?}: {e}", path))
+        .with_context(|| format!("failed to save {}", path.display()))
 }
 
-pub fn rgb_image_to_tensor<B: Backend>(image: &RgbImage, device: &B::Device) -> Tensor<B, 4> {
+/// `[1, 3, height, width]` with values in `[0, 1]`.
+pub fn rgb_image_to_tensor(image: &RgbImage, device: &Device) -> Tensor<4> {
     let (width, height) = image.dimensions();
-    let width = width as usize;
-    let height = height as usize;
-    let mut data = vec![0.0f32; 3 * width * height];
+    let (width, height) = (width as usize, height as usize);
+    let plane = width * height;
 
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = image.get_pixel(x as u32, y as u32);
-            let idx = y * width + x;
-            data[idx] = f32::from(pixel[0]) / 255.0;
-            data[width * height + idx] = f32::from(pixel[1]) / 255.0;
-            data[2 * width * height + idx] = f32::from(pixel[2]) / 255.0;
+    let mut data = vec![0.0f32; 3 * plane];
+    for (idx, pixel) in image.pixels().enumerate() {
+        for (channel, &value) in pixel.0.iter().enumerate() {
+            data[channel * plane + idx] = f32::from(value) / 255.0;
         }
     }
 
-    let tensor_data = TensorData::new(data, [1, 3, height, width]);
-    Tensor::<B, 4>::from_data(tensor_data, device)
+    Tensor::from_data(TensorData::new(data, [1, 3, height, width]), device)
 }
 
-pub fn tensor_to_rgb_image<B: Backend>(tensor: Tensor<B, 4>) -> Result<RgbImage> {
+/// Inverse of [`rgb_image_to_tensor`]; values are clamped to `[0, 1]`.
+pub fn tensor_to_rgb_image(tensor: Tensor<4>) -> Result<RgbImage> {
     let [batch, channels, height, width] = tensor.dims();
-    if batch != 1 || channels != 3 {
-        bail!("expected output shape [1, 3, H, W], got [{batch}, {channels}, {height}, {width}]");
-    }
-
-    let values = tensor
-        .to_data()
-        .into_vec::<f32>()
-        .map_err(|e| anyhow!("failed to decode tensor data: {e}"))?;
-
-    let expected_len = 3 * height * width;
-    if values.len() != expected_len {
-        bail!(
-            "unexpected tensor data len {}, expected {}",
-            values.len(),
-            expected_len
-        );
-    }
-
+    ensure!(
+        batch == 1 && channels == 3,
+        "expected shape [1, 3, H, W], got [{batch}, {channels}, {height}, {width}]"
+    );
     let mut image = RgbImage::new(width as u32, height as u32);
+    write_tensor_into(&mut image, tensor, 0, 0);
+    Ok(image)
+}
+
+/// Copies a `[1, 3, h, w]` tensor into `image` with its top-left corner at `(x0, y0)`.
+fn write_tensor_into(image: &mut RgbImage, tensor: Tensor<4>, x0: usize, y0: usize) {
+    let [_, _, height, width] = tensor.dims();
+    let plane = height * width;
+    let values = tensor
+        .into_data()
+        .try_to_vec_as::<f32>()
+        .expect("float tensor data converts to f32");
+    let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
 
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
-            let r = (values[idx].clamp(0.0, 1.0) * 255.0).round() as u8;
-            let g = (values[height * width + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
-            let b = (values[2 * height * width + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
-            image.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
+            let pixel = Rgb([
+                to_u8(values[idx]),
+                to_u8(values[plane + idx]),
+                to_u8(values[2 * plane + idx]),
+            ]);
+            image.put_pixel((x0 + x) as u32, (y0 + y) as u32, pixel);
         }
     }
-
-    Ok(image)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    type B = burn::backend::NdArray;
+    #[test]
+    fn tiles_cover_the_image_once() {
+        let tiling = Tiling {
+            tile_size: 4,
+            tile_pad: 1,
+        };
+        let tiles = tiling.tiles(6, 9);
+        assert_eq!(tiles.len(), 2 * 3);
+
+        let mut covered = vec![0; 6 * 9];
+        for tile in &tiles {
+            for y in tile.core.top..tile.core.bottom {
+                for x in tile.core.left..tile.core.right {
+                    covered[y * 9 + x] += 1;
+                }
+            }
+        }
+        assert!(covered.iter().all(|&n| n == 1));
+
+        let last = tiles.last().unwrap();
+        let expected_core = Region {
+            top: 4,
+            left: 8,
+            bottom: 6,
+            right: 9,
+        };
+        let expected_padded = Region {
+            top: 3,
+            left: 7,
+            bottom: 6,
+            right: 9,
+        };
+        assert_eq!(last.core, expected_core);
+        assert_eq!(last.padded, expected_padded);
+    }
 
     #[test]
-    fn rgb_image_tensor_roundtrip_preserves_shape() {
-        let mut image = RgbImage::new(2, 2);
-        image.put_pixel(0, 0, Rgb([10, 20, 30]));
-        image.put_pixel(1, 0, Rgb([40, 50, 60]));
-        image.put_pixel(0, 1, Rgb([70, 80, 90]));
-        image.put_pixel(1, 1, Rgb([100, 110, 120]));
+    fn no_tiling_is_one_tile() {
+        let tiles = Tiling::NONE.tiles(5, 7);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].core, tiles[0].padded);
+        assert_eq!((tiles[0].core.height(), tiles[0].core.width()), (5, 7));
+    }
 
-        let device = Default::default();
-        let tensor = rgb_image_to_tensor::<B>(&image, &device);
-        assert_eq!(tensor.dims(), [1, 3, 2, 2]);
+    #[cfg(feature = "flex")]
+    mod flex {
+        use super::super::*;
+        use crate::arch::{GeneratorConfig, RrdbNetConfig, SrvggNetCompactConfig};
 
-        let output = tensor_to_rgb_image::<B>(tensor).expect("tensor conversion should succeed");
-        assert_eq!(output.dimensions(), (2, 2));
+        fn test_image(width: u32, height: u32) -> RgbImage {
+            RgbImage::from_fn(width, height, |x, y| {
+                Rgb([(x * 20) as u8, (y * 30) as u8, ((x + y) * 7) as u8])
+            })
+        }
+
+        #[test]
+        fn rgb_tensor_roundtrip_is_lossless() {
+            let device = Device::flex();
+            let image = test_image(5, 3);
+            let tensor = rgb_image_to_tensor(&image, &device);
+            assert_eq!(tensor.dims(), [1, 3, 3, 5]);
+            assert_eq!(tensor_to_rgb_image(tensor).unwrap(), image);
+        }
+
+        #[test]
+        fn tiled_and_untiled_outputs_match() {
+            let device = Device::flex();
+            let model = GeneratorConfig::Srvgg(
+                SrvggNetCompactConfig::new(4)
+                    .with_num_feat(4)
+                    .with_num_conv(1),
+            )
+            .init(&device);
+            let image = test_image(11, 7);
+
+            let whole = upscale(&model, &image, Tiling::NONE, &device);
+            // The receptive field (3 convs, 3x3) fits in the padding, so tiles are seamless.
+            let tiling = Tiling {
+                tile_size: 4,
+                tile_pad: 3,
+            };
+            let tiled = upscale(&model, &image, tiling, &device);
+            assert_eq!(whole.dimensions(), (44, 28));
+            assert_eq!(tiled.dimensions(), whole.dimensions());
+            // Allow one step of rounding noise from different summation orders.
+            let max_diff = tiled
+                .as_raw()
+                .iter()
+                .zip(whole.as_raw())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max();
+            assert!(max_diff <= Some(1), "max pixel difference {max_diff:?}");
+        }
+
+        #[test]
+        fn odd_sizes_are_padded_for_pixel_unshuffle() {
+            let device = Device::flex();
+            let model = GeneratorConfig::Rrdb(
+                RrdbNetConfig::new(2)
+                    .with_num_feat(4)
+                    .with_num_block(1)
+                    .with_num_grow_ch(2),
+            )
+            .init(&device);
+            let tiling = Tiling {
+                tile_size: 4,
+                tile_pad: 1,
+            };
+            let output = upscale(&model, &test_image(7, 5), tiling, &device);
+            assert_eq!(output.dimensions(), (14, 10));
+        }
     }
 }
